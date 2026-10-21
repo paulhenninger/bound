@@ -37,7 +37,7 @@ Plus a **CLI client** that uses Flow B (back-channel approval with a user code).
 
 ## Running it
 
-Requires Node.js 20 or later. There are no dependencies to install.
+Requires Node.js 22 or later. There are no dependencies to install.
 
 ```bash
 npm start

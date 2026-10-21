@@ -1,4 +1,4 @@
-// Isomorphic encoding helpers (Node >= 20 and modern browsers).
+// Isomorphic encoding helpers (Node >= 22 and modern browsers).
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
