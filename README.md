@@ -109,6 +109,11 @@ popup's and RP page's `postMessage` handling with fake windows. Besides the happ
 - malformed claims, display names and grants (`act: ["constructor"]`)
 - duplicate passkey IDs and usernames; a damaged issuer data file; issuer outages
 
+## Contributing
+
+Attacks, spec problems and bug reports are the most useful contributions. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the ground rules and how the tests are organized.
+
 ## Layout
 
 ```
