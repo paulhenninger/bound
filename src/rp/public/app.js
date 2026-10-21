@@ -46,9 +46,29 @@ async function notesApi(path, opts) {
     await renewAndRedelegate();
     r = await api(path, opts);
   }
+  if (r.status === 401 && ['no_session', 'invalid_proof'].includes(r.data?.error)) {
+    // The session ended (idle, expired, or signed out elsewhere): back to sign-in.
+    await refresh();
+    $('#signin-error').textContent = 'Your session ended. Sign in again.';
+    throw new Error('Your session ended. Sign in again.');
+  }
   if (!r.ok) throw new Error(r.data?.error_description ?? r.data?.error ?? `HTTP ${r.status}`);
   return r.data;
 }
+
+/** What to tell the user when sign-in fails, by error code. */
+const SIGNIN_ERRORS = {
+  cancelled: 'Sign-in was cancelled.',
+  access_denied: 'Sign-in was cancelled.',
+  'timed out': 'Sign-in timed out. Try again.',
+  invalid_nonce: 'Sign-in took too long. Try again.',
+  expired: 'Sign-in took too long. Try again.',
+  invalid_audience: "Notebook asked Bound ID for access it doesn't recognise. This is a bug in Notebook.",
+  invalid_grants: "Notebook asked Bound ID for access it doesn't recognise. This is a bug in Notebook.",
+  too_many_grants: 'You have too many active grants. Revoke some at your Bound ID account, then try again.',
+  rate_limited: 'Too many attempts. Wait a minute and try again.',
+  busy: 'The service is busy. Try again in a minute.',
+};
 
 // ---- sign-in -------------------------------------------------------------
 async function signIn(withNotes, errorEl) {
@@ -68,13 +88,11 @@ async function signIn(withNotes, errorEl) {
       method: 'POST', token: tokens.identity,
       json: { access: tokens.access ? await delegate(tokens.access) : undefined },
     });
-    if (!r.ok) throw new Error(r.data?.error_description ?? r.data?.error);
+    if (!r.ok) throw new Error(r.data?.error ?? `HTTP ${r.status}`);
     await refresh();
   } catch (e) {
     if (!popup.closed) popup.close();
-    errorEl.textContent = {
-      cancelled: 'Sign-in was cancelled.', access_denied: 'Sign-in was cancelled.', 'timed out': 'Sign-in timed out.',
-    }[e.message] ?? e.message;
+    errorEl.textContent = SIGNIN_ERRORS[e.message] ?? `Sign-in failed (${e.message}).`;
   }
 }
 // Both must open the popup synchronously in the click (popup blockers).

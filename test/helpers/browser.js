@@ -3,11 +3,40 @@
 // session (the issuer's), a per-origin key that signs a proof on every call,
 // as the real pages do with boundFetch.
 
+import http from 'node:http';
 import { makeHolder } from '../../src/lib/keys.js';
 import { boundFetch } from '../../src/lib/client.js';
 
+/**
+ * A minimal fetch() that sends from a given local address (127.0.0.2, ...), so
+ * tests can act as different clients for per-address rate limits.
+ */
+export function fetchFrom(localAddress) {
+  return (url, init = {}) => new Promise((resolve, reject) => {
+    // family 4: "localhost" may resolve to ::1, which a 127.0.0.x source can't reach.
+    const req = http.request(url, { method: init.method ?? 'GET', headers: init.headers ?? {}, localAddress, family: 4 }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        resolve({
+          status: res.statusCode, ok: res.statusCode >= 200 && res.statusCode < 300,
+          headers: { get: (n) => { const v = res.headers[n.toLowerCase()]; return Array.isArray(v) ? v.join(', ') : v ?? null; } },
+          json: async () => JSON.parse(text), text: async () => text,
+        });
+      });
+    });
+    req.on('error', reject);
+    req.end(init.body === undefined ? undefined : Buffer.from(init.body));
+  });
+}
+
+/** Issuer `rates` option that turns every per-address limit off (tests run from one address). */
+export const NO_RATE_LIMITS = { http: false, signup: false, signin: false, device: false };
+
 export class Browser {
-  constructor({ boundOrigins = [] } = {}) {
+  constructor({ boundOrigins = [], fetch: f = globalThis.fetch } = {}) {
+    this.fetch = f;
     this.jar = new Map();
     this.boundOrigins = new Set(boundOrigins);   // origins whose pages sign every call
     this.keys = new Map();                       // origin -> page key
@@ -21,7 +50,7 @@ export class Browser {
       if ((init.method ?? 'GET') !== 'GET') headers.origin = pageOrigin;
       const cookie = this.jar.get(target);
       if (cookie) headers.cookie = cookie;
-      const res = await fetch(url, { ...init, headers });
+      const res = await this.fetch(url, { ...init, headers });
       const set = res.headers.get('set-cookie');
       if (set) {
         const pair = set.split(';')[0];

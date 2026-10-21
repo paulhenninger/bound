@@ -49,6 +49,9 @@ if (holder && state.access && actions.every((a) => state.actions.includes(a))) {
 }
 
 if (!access) {
+  // We're about to replace the saved key, so give its grant back first rather
+  // than leave it renewable with a key nobody will hold.
+  if (holder && state.access) await boundFetch(holder, md.revoke_endpoint, { method: 'POST', token: state.access }).catch(() => {});
   const kp = await generateKeyPair({ extractable: true });
   holder = await makeHolder(kp);
   state = { issuer: cfg.ISSUER, key: await exportPrivateJwk(kp.privateKey), actions };

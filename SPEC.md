@@ -1,6 +1,6 @@
 # Bound: Key-Bound, Browser-Mediated Authentication and Authorization
 
-**Version:** 1 (draft 0.2)
+**Version:** 1 (draft 0.3)
 **Status:** Experimental design. Not reviewed, not formally analyzed. Do not deploy.
 **Reference implementation:** [`src/`](src/) in this repository.
 **Background:** [docs/oauth-oidc-analysis.md](docs/oauth-oidc-analysis.md) explains why this exists.
@@ -190,7 +190,8 @@ An issuer **MUST** publish metadata at `GET <issuer>/.well-known/bound-issuer`:
   reject a mismatch.
 - `keys` lists the current signing keys, each with a `kid`. To rotate, publish the new
   key alongside the old one, start signing with the new key, and remove the old key once
-  every token signed with it has expired and its renewal window has closed.
+  every token signed with it has expired and its renewal window has closed. (The reference
+  issuer does this with `npm run rotate-key`.)
 - Verifiers **SHOULD** cache keys and refetch when they see an unknown `kid`, at most
   once every 30 seconds, with one fetch in flight at a time. If the issuer cannot be
   reached they **SHOULD** back off for a few seconds and answer `503`
@@ -381,6 +382,13 @@ server issued moments before, which nobody can know in advance.
   and previous window, so it needs no server-side storage).
 - Bound sessions (§9) and issuer sessions (§13) **MUST** require nonces. Resource servers
   **MAY**. Their tokens live ≤ 5 minutes, which already bounds pre-signed proofs.
+- A server that requires nonces from cross-origin browser clients **MUST** list
+  `Bound-Nonce` in `Access-Control-Expose-Headers`, or the client can never read it.
+- Because the client resends the same request after `use_nonce`, a server **MUST** check
+  the proof, nonce included, *before* it consumes any single-use input carried by that
+  request (a passkey challenge, a sign-in nonce, a user code). Otherwise the retry finds
+  the input already spent, and a user whose passkey prompt outlasted a nonce cannot sign
+  in.
 
 ---
 
@@ -500,7 +508,7 @@ matches.
 
 | Member | Req. | Meaning |
 |---|---|---|
-| `nonce` | ✓ | 16–128 characters, minted by the RP server, single-use, ≤ 5 min lifetime |
+| `nonce` | ✓ | 16–128 characters, minted by the RP server, single-use, ≤ 5 min lifetime. The RP **SHOULD** seal it (MAC + expiry) rather than store it, and record it as used only when an identity token carrying it is accepted (§15.7). |
 | `jkt` | ✓ | Thumbprint of the agent key (43 b64u characters) |
 | `claims` | – | Array of attributes to release: `"name"`, `"username"`. Anything else is an error. |
 | `access` | – | `{ aud: [rs-origin], grants: [...] }`: request an access token as well |
@@ -569,6 +577,8 @@ whose `jkt` equals the session's agent key and which carries a fresh server nonc
   absolute limit (the reference RP uses 8 hours) and an idle timeout (1 hour).
 - Ending a session (logout) **MUST** require the same proof as any other request, so a
   stolen cookie cannot be used to log the victim out.
+- The RP **SHOULD** cap sessions per user (the reference RP ends the oldest beyond 10),
+  so one account cannot fill the session store.
 - Cookie-authenticated state-changing endpoints **MUST** also check the `Origin` header.
 - When the user signs out, the page **SHOULD** give its root access token back
   (§12.4) and **SHOULD** discard its agent key and make a new one, so the next account
@@ -613,8 +623,12 @@ The issuer records `jkt(proof)` as the only key that may collect the result.
 `client_name` is self-asserted, so the issuer **MUST** keep it from passing as something
 it is not. It must be 1–64 printable characters, with no control, format or bidi-override
 characters, and must not contain `://`, `/` or `\`, so it cannot look like a site address.
-Pending requests and their codes are state any key can create. Issuers **MUST** expire
-them and cap how many exist (`503` `busy` when full).
+Pending requests and their codes are state any key can create, and keys cost nothing.
+Issuers **MUST** expire them and **MUST** limit how many one network source can create
+(the reference issuer allows a burst of 10, then one every 30 seconds, per address), so one
+client cannot fill the store for everyone. A global cap remains only as a memory backstop.
+Flow B endpoints accept proofs from any key, so their replay cache **MUST** be separate
+from the one sessions and renewal use (§15.7).
 
 ### 10.2 Interaction
 
@@ -702,7 +716,10 @@ extends it. Approving *different* access replaces it (the old grant is revoked),
 broader earlier grant cannot linger, still renewable, behind a narrower new one. Users
 **MUST** be able to list and revoke their grants at the issuer. The list **MUST** show
 whether the client's name was verified by the browser (`kind` = site) or self-asserted
-(`kind` = device).
+(`kind` = device). Issuers **SHOULD** cap live grants per user (the reference issuer
+refuses a new one beyond 100 with `409` `too_many_grants`) and **SHOULD** forget grants
+once their renewal window has closed, so the store does not grow without bound. Renewal
+or revocation with a forgotten grant's token gives `401` `renewal_window_closed`.
 
 ### 12.2 Renewal
 
@@ -758,9 +775,10 @@ Authorization: Bound <root access token, possibly expired>
 Bound-Proof: <proof by the holder>
 ```
 
-The issuer applies renewal steps 1–5 (§12.2) and marks the grant revoked: `200
-{ "ok": true }`. Only the root holder can do this. A delegate holds a multi-block token
-and gets `400` `not_renewable`.
+The issuer applies renewal steps 1–4 (§12.2), looks up the grant by `gid` and `jkt`, and
+marks it revoked: `200 { "ok": true }`. Revocation is idempotent: a grant that is already
+revoked, or has ended, also gives `200`. Only the root holder can do this. A delegate
+holds a multi-block token and gets `400` `not_renewable`.
 
 ---
 
@@ -778,7 +796,14 @@ verification required, and **SHOULD NOT** offer passwords. Issuers:
 - at registration, **MUST** require the credential ID the client reports to equal the one
   in the attested credential data, and **MUST** refuse a credential ID or username that
   already belongs to an account, checked again at verification time, not only when the
-  options are issued.
+  options are issued;
+- **SHOULD** issue challenges without storing them (sealed with a MAC and an expiry) and
+  record a challenge as used only after the whole ceremony has succeeded, session proof
+  included (§6.5, §15.7);
+- **MUST** limit account creation and sign-in attempts per network source, and **SHOULD**
+  cap sessions per account (the reference issuer ends the oldest beyond 10);
+- **SHOULD** let users register more than one passkey, remove passkeys (never the
+  last), and delete their account, which revokes all of its grants.
 
 The issuer's own session cookie **SHOULD** be device-bound (DBSC, or per-request proofs
 with server nonces as in §9) for the same reasons as §9. The reference issuer binds it to
@@ -821,12 +846,14 @@ resource servers also appear in `WWW-Authenticate: Bound error="<code>"`.
 | `access_denied` | 403 | User denied, or revoked before collection |
 | `invalid_request`, `invalid_grants`, `invalid_audience`, `invalid_nonce` | 400 | Bad request parameters |
 | `issuer_unavailable` | 503 | The verifier could not fetch the issuer's keys |
-| `busy` | 503 | A bounded store (replay cache, pending requests, nonces) is full |
+| `too_many_grants` | 409 | The user has reached the issuer's limit on live grants (§12.1) |
+| `rate_limited` | 429 | Too many requests from this network source; see `Retry-After` |
+| `busy` | 503 | A bounded store (replay cache, pending requests) is at its memory backstop |
 
 The reference implementation also uses these demo-specific codes, outside the protocol:
 `login_required`, `bad_origin`, `no_session`, `invalid_challenge`, `passkey_rejected`,
 `unknown_credential`, `unknown_code`, `username_taken`, `credential_exists`,
-`invalid_access`, `access_expired`, `no_access`.
+`last_passkey`, `invalid_access`, `access_expired`, `no_access`.
 
 ---
 
@@ -913,9 +940,22 @@ can remove the dependency for proofs.
 - **Compare jkt values exactly.** They are canonical by construction.
 - **Never crash on input.** Cookie, header, URL and percent-decoding must not throw past
   the request handler; one malformed request must not stop a server.
-- **Bound everything an unauthenticated client can create** (challenges, sign-in nonces,
-  pending requests, sessions, replay-cache entries): expire it and cap it, failing closed
-  with `503` when full.
+- **Don't let anonymous clients fill shared state.** A global cap that refuses new
+  entries when full turns a memory problem into a lockout: one client fills it and
+  everyone is refused. Instead:
+  - *Seal, don't store,* what the server hands out (challenges, sign-in nonces): MAC it
+    with an expiry, and record it only when it is *used* successfully, after the check
+    that costs the caller real work (a passkey signature, an issuer-signed token).
+  - *Limit per source* what must be stored (pending Flow B requests, accounts,
+    sign-in attempts, sessions per account), and keep any global cap as a memory
+    backstop only.
+  - *Partition* shared caches by how much the caller had to prove: anonymous proofs
+    must not fill the replay cache that sessions and renewal depend on.
+  - Rate limiters themselves must fail open when their own tables are full, or they
+    become the lockout.
+- **Check before you consume.** Verify everything a request carries (proof, nonce,
+  signatures) before spending any single-use input in it, so a client's retry still works
+  (§6.5).
 - **Validate types, not just presence.** Check that strings are strings and arrays are
   arrays, and look up names in own properties only (`constructor` is not an action).
 

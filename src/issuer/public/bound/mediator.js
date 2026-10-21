@@ -76,7 +76,13 @@ async function consent(user, rpOrigin) {
       });
       respond(out);
     } catch (e) {
-      $('#consent-error').textContent = e.message;
+      if (e.code === 'login_required') {
+        // The Bound ID session ended while this screen was open: sign in again.
+        showAuth(rpOrigin);
+        $('#auth .auth-error').textContent = 'Your Bound ID session ended. Sign in again to continue.';
+        return;
+      }
+      $('#consent-error').textContent = e.code === 'too_many_grants' ? e.message : `Could not continue: ${e.message}`;
       guard = guardButtons([$('#approve')]);
     }
   };

@@ -75,9 +75,11 @@ The CLI keeps its key and token in `~/.bound/notes-cli.json` (override with
 `BOUND_CLI_STATE`), so later runs renew without asking again. `npm run cli -- --forget`
 revokes the grant and deletes the file.
 
-Issuer state (signing key, accounts and grants) is kept in `data/issuer.json`, written
+Issuer state (signing keys, accounts and grants) is kept in `data/issuer.json`, written
 atomically. If the file is damaged the issuer refuses to start rather than replace it.
 Delete it to start fresh, and delete the matching passkey from your authenticator too.
+At http://localhost:4100 you can add a second passkey, remove passkeys, and delete your
+account. To rotate the issuer's signing key, stop the demo and run `npm run rotate-key`.
 
 ## Tests
 
@@ -85,7 +87,7 @@ Delete it to start fresh, and delete the matching passkey from your authenticato
 npm test
 ```
 
-79 tests, using Node's built-in runner. They include a software WebAuthn authenticator,
+102 tests, using Node's built-in runner. They include a software WebAuthn authenticator,
 run the three servers over real HTTP with a simulated browser, and drive the mediator
 popup's and RP page's `postMessage` handling with fake windows. Besides the happy paths
 (both flows, delegation, renewal, revocation), they exercise attacks:
@@ -103,7 +105,9 @@ popup's and RP page's `postMessage` handling with fake windows. Besides the happ
 - proofs pre-signed for later use (server nonces), high-S signature twins
 - grant escapes through encoded slashes (`/notes/..%2Fadmin`)
 - malformed cookies, paths and request targets (must never crash a server)
-- floods of challenges, nonces and Flow B requests (bounded, `503 busy`)
+- floods of challenges, nonces and Flow B requests: nothing anonymous is stored, and
+  per-address limits throttle the flooding client without locking anyone else out
+- a passkey prompt slower than a nonce's lifetime (the retry must still work)
 - forged `postMessage` sources and origins, plain-HTTP RP origins, consent clickjacking
 - device names posing as site addresses; Flow B code guessing (rate-limited)
 - malformed claims, display names and grants (`act: ["constructor"]`)
@@ -128,7 +132,7 @@ src/lib/                        isomorphic library (Node + browser, WebCrypto on
   agent.js       browser: non-exportable agent key, mediator popup (Flow A polyfill)
   webauthn.js    passkey verification (ES256, no CBOR needed)
   http.js        tiny HTTP server helpers for the demo
-  state.js       bounded, self-expiring in-memory maps
+  state.js       sealed tokens, rate limiters, bounded self-expiring maps
   origins.js     which RP origins may sign in
 src/issuer/     issuer server + pages (account, mediator popup, device approval)
 src/rp/         relying party server + Notebook page
@@ -147,5 +151,8 @@ test/           unit and end-to-end tests
 - **In-memory state** for sessions, notes and pending requests (bounded and
   self-expiring). Restarting logs everyone out. The issuer's keys, accounts and grants
   persist.
+- **Rate limits per network address.** Behind a reverse proxy every user would share the
+  proxy's address; a real deployment would key the limits on the forwarded client
+  address from a trusted proxy.
 - **Flow A uses the popup polyfill** (SPEC §8.2), since no browser implements the native
   API (§8.1).

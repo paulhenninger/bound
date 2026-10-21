@@ -12,13 +12,15 @@ import { verifyToken, parseToken, attenuate } from '../lib/token.js';
 import { verifyProof, ReplayCache, NonceIssuer } from '../lib/proof.js';
 import { authenticate, IssuerDirectory, AuthError } from '../lib/verifier.js';
 import { boundFetch } from '../lib/client.js';
-import { ExpiringMap } from '../lib/state.js';
+import { ExpiringMap, Sealer } from '../lib/state.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(here, '..', '..');
 
 const SESSION_TTL = 8 * 3600;     // absolute session lifetime
 const SESSION_IDLE = 3600;        // a session ends after this long without a request
+const SESSIONS_PER_USER = 10;     // oldest is ended when a user exceeds this
+const NONCE_TTL = 300;
 
 export async function createRelyingParty(opts = {}) {
   const origin = opts.origin ?? cfg.RP;
@@ -27,8 +29,13 @@ export async function createRelyingParty(opts = {}) {
   const directory = opts.directory ?? new IssuerDirectory(issuer);
   const replay = new ReplayCache();
   const serverKey = await makeHolder();   // this server's own non-exportable key
-  const loginNonces = new ExpiringMap({ max: opts.maxNonces ?? 10000 });     // sign-in nonce -> true
+  // Sign-in nonces are sealed, not stored: handing them out costs nothing, so
+  // anonymous clients can't exhaust them. A nonce is recorded as used only when
+  // an identity token carrying it is accepted, which takes the issuer's signature.
+  const sealer = new Sealer();
+  const usedNonces = new ExpiringMap({ max: opts.maxUsedNonces ?? 100000 });
   const sessions = new ExpiringMap({ max: opts.maxSessions ?? 100000 });     // sid -> { sub, claims, jkt, access, expires }
+  const userSessions = new Map();                                            // sub -> [sid], oldest first
   const proofNonces = new NonceIssuer();  // server nonces for session proofs (SPEC §9)
 
   // ---- bound session -----------------------------------------------------
@@ -78,11 +85,7 @@ export async function createRelyingParty(opts = {}) {
 
   const routes = [
     ['GET /bound/config', () => ({ origin, issuer, rs: rsOrigin, serverKey: serverKey.jwk })],
-    ['POST /bound/nonce', () => {
-      const nonce = randomId(24);
-      loginNonces.set(nonce, true, now() + 300);
-      return { nonce };
-    }],
+    ['POST /bound/nonce', async () => ({ nonce: await sealer.seal(0, NONCE_TTL) })],
 
     // Exchange an identity token (+ proof by its holder) for a bound session.
     ['POST /bound/session', async (ctx) => {
@@ -99,15 +102,22 @@ export async function createRelyingParty(opts = {}) {
       }
       const { token } = auth;
       if (token.blockCount !== 1 || token.root.grants.length) throw new HttpError(400, 'invalid_token', 'not an identity token');
-      const fresh = typeof token.root.nonce === 'string' && loginNonces.take(token.root.nonce);
-      if (!fresh) throw new HttpError(400, 'invalid_nonce');
+      const n = await sealer.open(token.root.nonce);
+      if (!n || usedNonces.has(n.id)) throw new HttpError(400, 'invalid_nonce');
 
       const { access } = ctx.json();
       const claims = token.root.claims && typeof token.root.claims === 'object' ? token.root.claims : {};
       const s = { sub: token.sub, claims, jkt: token.holder, created: now(), expires: now() + SESSION_TTL };
       if (access) s.access = await checkDelegatedAccess(access, s.jkt);
+      if (usedNonces.has(n.id)) throw new HttpError(400, 'invalid_nonce');   // a concurrent request won
+      usedNonces.set(n.id, true, n.exp);
       const sid = randomId(32);
       sessions.set(sid, s, Math.min(s.expires, now() + SESSION_IDLE));
+      // Each user has a bounded number of sessions; signing in again ends the oldest.
+      const mine = (userSessions.get(s.sub) ?? []).filter((x) => sessions.has(x));
+      mine.push(sid);
+      while (mine.length > SESSIONS_PER_USER) sessions.delete(mine.shift());
+      userSessions.set(s.sub, mine);
       ctx.res.setHeader('set-cookie', cookie(origin, 'rp_sid', sid, SESSION_TTL));
       return { user: { sub: s.sub, ...s.claims }, access: !!s.access };
     }],
@@ -168,7 +178,7 @@ export async function createRelyingParty(opts = {}) {
   ];
 
   const server = createServer({
-    origin, routes, nonces: proofNonces,
+    origin, routes, nonces: proofNonces, rate: opts.rate,
     staticDirs: { '/lib/': join(ROOT, 'src', 'lib'), '/': join(here, 'public') },
     headers: {
       'content-security-policy': `default-src 'self'; connect-src 'self' ${issuer}; frame-ancestors 'none'; base-uri 'none'`,

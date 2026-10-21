@@ -109,12 +109,12 @@ export class ReplayCache {
  * which bounds what script that briefly controls a page can sign in advance.
  */
 export class NonceIssuer {
-  #key;
+  // A promise, created synchronously, so concurrent first calls share one key.
+  #key = crypto.subtle.importKey('raw', crypto.getRandomValues(new Uint8Array(32)),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   constructor({ window = 30 } = {}) { this.window = window; }
   async #mac(w) {
-    this.#key ??= await crypto.subtle.importKey('raw', crypto.getRandomValues(new Uint8Array(32)),
-      { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-    return b64u(new Uint8Array(await crypto.subtle.sign('HMAC', this.#key, utf8(String(w)))).subarray(0, 16));
+    return b64u(new Uint8Array(await crypto.subtle.sign('HMAC', await this.#key, utf8(String(w)))).subarray(0, 16));
   }
   async current(t = nowSec()) {
     const w = Math.floor(t / this.window);

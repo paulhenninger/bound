@@ -32,13 +32,14 @@ export async function logout() {
   }
 }
 
-export async function register(username, displayName) {
-  const o = await post('/webauthn/register/options', { username, displayName });
+/** Run navigator.credentials.create() for server options and send the result back. */
+async function createPasskey(o) {
   const cred = await navigator.credentials.create({
     publicKey: {
       challenge: unb64u(o.challenge), rp: o.rp,
       user: { id: unb64u(o.user.id), name: o.user.name, displayName: o.user.displayName },
       pubKeyCredParams: o.pubKeyCredParams, authenticatorSelection: o.authenticatorSelection,
+      excludeCredentials: (o.excludeCredentials ?? []).map((c) => ({ type: c.type, id: unb64u(c.id) })),
       attestation: o.attestation, timeout: o.timeout,
     },
   });
@@ -55,6 +56,16 @@ export async function register(username, displayName) {
       },
     },
   })).user;
+}
+
+/** Create an account with a new passkey. */
+export async function register(username, displayName) {
+  return createPasskey(await post('/webauthn/register/options', { username, displayName }));
+}
+
+/** Add another passkey to the signed-in account (e.g. a second device). */
+export async function addPasskey() {
+  return createPasskey(await post('/webauthn/register/options', { add: true }));
 }
 
 export async function login() {

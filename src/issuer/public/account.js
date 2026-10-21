@@ -1,4 +1,4 @@
-import { session, bindAuthForm, api, post, logout, describeGrant } from '/passkey.js';
+import { session, bindAuthForm, api, post, logout, addPasskey, describeGrant } from '/passkey.js';
 
 const $ = (s) => document.querySelector(s);
 
@@ -43,11 +43,29 @@ function grantItem(g, user) {
   return li;
 }
 
+function showPasskeys(user) {
+  $('#passkeys').replaceChildren(...user.passkeys.map((p, i) => {
+    const li = document.createElement('li');
+    const label = Object.assign(document.createElement('span'), { className: 'small', textContent: `Passkey ${i + 1}, added ${new Date(p.created * 1000).toLocaleString()}` });
+    const del = Object.assign(document.createElement('button'), { className: 'link', textContent: 'Remove' });
+    del.disabled = user.passkeys.length === 1;
+    del.title = del.disabled ? 'Your only passkey; add another first' : '';
+    del.onclick = async () => {
+      $('#passkey-error').textContent = '';
+      try { showPasskeys((await post(`/api/passkeys/${encodeURIComponent(p.id)}/delete`)).user); }
+      catch (e) { $('#passkey-error').textContent = e.message; }
+    };
+    li.append(label, del);
+    return li;
+  }));
+}
+
 async function show(user) {
   $('#auth').classList.toggle('hidden', !!user);
   $('#account').classList.toggle('hidden', !user);
   if (!user) return;
   $('#who').textContent = `${user.displayName} (@${user.username})`;
+  showPasskeys(user);
   const ul = $('#grants');
   try {
     const { grants } = await api('/api/grants');
@@ -60,5 +78,18 @@ async function show(user) {
 }
 
 bindAuthForm($('#auth'), show);
+$('#add-passkey').onclick = async () => {
+  $('#passkey-error').textContent = '';
+  try { showPasskeys(await addPasskey()); }
+  catch (e) { $('#passkey-error').textContent = e.name === 'NotAllowedError' ? 'Passkey prompt was cancelled.' : e.message; }
+};
+$('#delete-account').onclick = async () => {
+  $('#delete-error').textContent = '';
+  try {
+    await post('/api/account/delete', { username: $('#confirm-username').value.trim() });
+    await logout().catch(() => {});
+    show(null);
+  } catch (e) { $('#delete-error').textContent = e.message; }
+};
 $('#logout').onclick = async () => { await logout().catch(() => {}); show(null); };
 show(await session());

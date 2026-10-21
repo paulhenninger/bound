@@ -19,7 +19,7 @@ issue first so we can agree it belongs in v1 rather than in §18 (open issues).
 You need Node.js 22 or later. There is nothing to install.
 
 ```bash
-npm test     # 79 tests, about a second
+npm test     # 102 tests, a few seconds
 npm start    # the demo: issuer :4100, Notebook :4200, Notes API :4300
 ```
 
@@ -60,7 +60,9 @@ Tests use Node's built-in runner (`node:test`) and live in `test/`:
 | `hardening.test.js` | Library-level regressions from the security review |
 | `browser-side.test.js` | Mediator popup and RP page `postMessage` handling, consent-button guard (fake windows) |
 | `e2e.test.js` | All three servers over real HTTP: both flows, delegation, renewal, attacks |
-| `e2e-hardening.test.js` | End-to-end regressions from the security review |
+| `e2e-hardening.test.js` | End-to-end regressions from the first security review |
+| `e2e-availability.test.js` | Slow passkey prompts, anonymous floods, per-address limits, bounded growth, key rotation, account tools |
+| `sources.test.js` | Every source file parses; browser pages' imports resolve and use no Node-only APIs |
 
 Helpers:
 
@@ -68,10 +70,12 @@ Helpers:
   a browser would send. Options let you forge flags, challenges and credential IDs.
 - `helpers/browser.js`: a simulated browser with a cookie jar and `Origin` headers. Pass
   `boundOrigins: [ISSUER]` and it signs a proof on every issuer call, as the real issuer
-  pages do.
+  pages do. `fetchFrom('127.0.0.2')` sends from another loopback address, to act as a
+  different client for rate limits. `NO_RATE_LIMITS` turns the issuer's per-address
+  limits off for tests that make many requests from one address.
 
-End-to-end tests start real servers on fixed ports: 5100–5300 (`e2e.test.js`) and
-5600–5619 (`e2e-hardening.test.js`). Pick an unused range for a new file. Tests write
+End-to-end tests start real servers on fixed ports: 5100–5300 (`e2e.test.js`),
+5600–5619 (`e2e-hardening.test.js`) and 5620–5629 (`e2e-availability.test.js`). Pick an unused range for a new file. Tests write
 issuer state to a temporary directory, never to `data/`.
 
 Write attack tests the way the attacker would: forge the request by hand rather than
