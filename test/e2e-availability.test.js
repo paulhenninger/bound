@@ -194,22 +194,26 @@ test('per-address limits: one address is throttled, others are not', async () =>
   // Passkey sign-in attempts: 20 at once per address.
   const f5 = fetchFrom('127.0.0.5');
   const tries = [];
-  for (let i = 0; i < 21; i++) {
+  const t1 = Date.now();
+  for (let i = 0; i < 25; i++) {
     tries.push((await f5(`${iss}/webauthn/login/verify`, { method: 'POST', headers: { origin: iss, 'content-type': 'application/json' }, body: '{}' })).status);
   }
-  assert.ok(tries.slice(0, 20).every((s) => s === 400) && tries[20] === 429, JSON.stringify(tries));
+  // 20 at once, then one every 5 s (allow for refills on a slow machine).
+  const attempted = tries.filter((s) => s === 400).length;
+  assert.ok(attempted >= 20 && attempted <= 20 + Math.ceil((Date.now() - t1) / 5000), JSON.stringify(tries));
+  assert.ok(tries.includes(429), JSON.stringify(tries));
 
   // Everything else: a burst of 500 per address.
   const f6 = fetchFrom('127.0.0.6');
   const burst = [];
   const t0 = Date.now();
-  for (let i = 0; i < 1500; i += 50) burst.push(...await Promise.all(Array.from({ length: 50 }, () => f6(`${iss}/.well-known/bound-issuer`).then((r) => r.status))));
-  const allowed = burst.filter((s) => s === 200).length;
+  for (let i = 0; i < 1500; i += 50) burst.push(...await Promise.all(Array.from({ length: 50 }, () => f6(`${iss}/.well-known/bound-issuer`))));
+  const allowed = burst.filter((r) => r.status === 200).length;
+  // The bucket refills at 50/s while the burst runs, so allow for elapsed time.
   assert.ok(allowed <= 500 + 50 * ((Date.now() - t0) / 1000 + 1), `${allowed} allowed`);
-  assert.ok(burst.includes(429));
-  const r = await f6(`${iss}/.well-known/bound-issuer`);
-  assert.equal(r.status, 429);
-  assert.ok(Number(r.headers.get('retry-after')) >= 1, 'says when to come back');
+  const refused = burst.find((r) => r.status === 429);
+  assert.ok(refused, 'some requests refused');
+  assert.ok(Number(refused.headers.get('retry-after')) >= 1, 'says when to come back');
   assert.equal((await fetchFrom('127.0.0.7')(`${iss}/.well-known/bound-issuer`)).status, 200);
 });
 
