@@ -1,5 +1,7 @@
 # Bound
 
+[![Tests](https://github.com/paulhenninger/bound/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/paulhenninger/bound/actions/workflows/test.yml)
+
 **A key-bound, browser-mediated alternative to OAuth 2.0 + OpenID Connect.**
 This repository contains a specification and a working, dependency-free reference
 implementation.
