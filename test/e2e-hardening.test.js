@@ -15,7 +15,7 @@ import { attenuate, parseToken } from '../src/lib/token.js';
 import { boundFetch } from '../src/lib/client.js';
 import { createProof } from '../src/lib/proof.js';
 import { SoftAuthenticator } from './helpers/soft-authenticator.js';
-import { Browser } from './helpers/browser.js';
+import { Browser, NO_RATE_LIMITS } from './helpers/browser.js';
 
 const ISSUER = 'http://localhost:5600';
 const RP = 'http://localhost:5601';
@@ -29,9 +29,11 @@ const newBrowser = () => new Browser({ boundOrigins: [ISSUER] });
 
 before(async () => {
   dir = await mkdtemp(join(tmpdir(), 'bound-hardening-'));
-  issuer = await createIssuer({ origin: ISSUER, dataFile: join(dir, 'issuer.json'), resourceServers: rsMap });
-  const rs = createResourceServer({ origin: RS, issuer: ISSUER });
-  rp = await createRelyingParty({ origin: RP, issuer: ISSUER, rs: RS });
+  // One address sends everything here, so per-address limits are off on these
+  // servers; tests of the limits start servers with the defaults.
+  issuer = await createIssuer({ origin: ISSUER, dataFile: join(dir, 'issuer.json'), resourceServers: rsMap, rates: NO_RATE_LIMITS });
+  const rs = createResourceServer({ origin: RS, issuer: ISSUER, rate: false });
+  rp = await createRelyingParty({ origin: RP, issuer: ISSUER, rs: RS, rate: false });
   for (const s of [issuer, rs, rp]) { await s.listen(); servers.push(s.server); }
 });
 after(async () => {
@@ -250,8 +252,9 @@ test('issuer saves are atomic and leave no temporary files', async () => {
 
 // ---- M7: unauthenticated callers can't grow state without bound ----------------------
 
-test('state that anyone can create is capped (503 busy, not unbounded memory)', async () => {
-  const small = await createIssuer({ origin: 'http://localhost:5610', dataFile: join(dir, 'small.json'), resourceServers: rsMap, limits: { requests: 2, challenges: 2 } });
+test('pending Flow B requests have a hard memory cap as a last resort', async () => {
+  // Per-address limits (e2e-availability.test.js) stop one client getting near it.
+  const small = await createIssuer({ origin: 'http://localhost:5610', dataFile: join(dir, 'small.json'), resourceServers: rsMap, limits: { requests: 2 }, rates: NO_RATE_LIMITS });
   await small.listen();
   servers.push(small.server);
   const cli = await makeHolder();
@@ -261,16 +264,6 @@ test('state that anyone can create is capped (503 busy, not unbounded memory)', 
   const third = await ask();
   assert.equal(third.status, 503);
   assert.equal(third.data.error, 'busy');
-  const opt = () => fetch('http://localhost:5610/webauthn/login/options', { method: 'POST' });
-  await opt(); await opt();
-  assert.equal((await opt()).status, 503);
-
-  const smallRp = await createRelyingParty({ origin: 'http://localhost:5611', issuer: ISSUER, rs: RS, maxNonces: 2 });
-  await smallRp.listen();
-  servers.push(smallRp.server);
-  const nonce = () => fetch('http://localhost:5611/bound/nonce', { method: 'POST' });
-  await nonce(); await nonce();
-  assert.equal((await nonce()).status, 503);
 });
 
 // ---- M8: input validation at the issuer ----------------------------------------------

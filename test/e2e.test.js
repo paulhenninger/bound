@@ -15,7 +15,7 @@ import { attenuate, parseToken } from '../src/lib/token.js';
 import { boundFetch } from '../src/lib/client.js';
 import { createProof } from '../src/lib/proof.js';
 import { SoftAuthenticator } from './helpers/soft-authenticator.js';
-import { Browser } from './helpers/browser.js';
+import { Browser, NO_RATE_LIMITS } from './helpers/browser.js';
 
 const ISSUER = 'http://localhost:5100';
 const RP = 'http://localhost:5200';
@@ -31,10 +31,12 @@ const newBrowser = () => new Browser({ boundOrigins: [ISSUER] });
 before(async () => {
   dir = await mkdtemp(join(tmpdir(), 'bound-'));
   const rsMap = { [RS]: { name: 'Notes API', actions: { read: 'Read', write: 'Write' } } };
-  const issuer = await createIssuer({ origin: ISSUER, dataFile: join(dir, 'issuer.json'), resourceServers: rsMap });
+  // Every request in these tests comes from one address, so per-address rate
+  // limits are off here; e2e-hardening.test.js tests them.
+  const issuer = await createIssuer({ origin: ISSUER, dataFile: join(dir, 'issuer.json'), resourceServers: rsMap, rates: NO_RATE_LIMITS });
   issuerHandle = issuer;
-  const rs = createResourceServer({ origin: RS, issuer: ISSUER });
-  const rp = await createRelyingParty({ origin: RP, issuer: ISSUER, rs: RS });
+  const rs = createResourceServer({ origin: RS, issuer: ISSUER, rate: false });
+  const rp = await createRelyingParty({ origin: RP, issuer: ISSUER, rs: RS, rate: false });
   for (const s of [issuer, rs, rp]) { await s.listen(); servers.push(s.server); }
 });
 after(async () => {
@@ -204,7 +206,7 @@ test('expired tokens are refused by the RS but renewable by their holder', async
   const { agent, tokens } = await signIn(b);
   // Re-sign the user's real access token as if it had been issued 20 minutes ago.
   const root = parseToken(tokens.access)[0].payload;
-  const { privateKey } = await importKeyPairJwk(issuerHandle.db.key);
+  const { privateKey } = await importKeyPairJwk(issuerHandle.db.keys.at(-1).key);
   const old = { ...root, iat: now() - 1200, exp: now() - 900 };
   const p = b64uJson(old);
   const expired = `bnd1~${p}.${await sign(privateKey, p)}`;

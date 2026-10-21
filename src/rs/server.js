@@ -59,8 +59,11 @@ export function createResourceServer(opts = {}) {
     }],
   ];
 
+  // No per-address limit by default: much of an RS's traffic comes from RP
+  // servers acting for many users at once, and every request needs a valid
+  // token, so anonymous clients can't make it store anything.
   const server = createServer({
-    origin, routes,
+    origin, routes, rate: opts.rate ?? false,
     cors: () => ({
       'access-control-allow-origin': '*',
       'access-control-allow-headers': 'authorization, bound-proof, content-type',

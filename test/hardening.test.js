@@ -6,7 +6,7 @@ import { makeHolder, sign, verify } from '../src/lib/keys.js';
 import { createProof, verifyProof, ReplayCache, NonceIssuer, ProofError } from '../src/lib/proof.js';
 import { allows } from '../src/lib/token.js';
 import { b64u, b64uJson, unb64u, sha256b64u, randomId, now } from '../src/lib/encoding.js';
-import { ExpiringMap, CapacityError } from '../src/lib/state.js';
+import { ExpiringMap, CapacityError, Sealer, RateLimiter, RateLimitError } from '../src/lib/state.js';
 import { IssuerDirectory, IssuerUnavailableError } from '../src/lib/verifier.js';
 import { parseCookies, cookie } from '../src/lib/http.js';
 import { isAllowedRpOrigin } from '../src/lib/origins.js';
@@ -168,4 +168,44 @@ test('registration: the credential id must be the one in the authenticator data'
   swapped.id = b64u(new Uint8Array(16).fill(7));   // claim someone else's credential id
   await assert.rejects(reg(swapped), (e) => e instanceof WebAuthnError && /does not match/.test(e.message));
   await assert.rejects(reg(a.create(opts, 'https://id.example', { flags: 0x05 })), /no attested credential data/);
+});
+
+// ---- second review --------------------------------------------------------------
+
+test('nonces issued while a server is starting are all valid (one key, not one per caller)', async () => {
+  for (let i = 0; i < 20; i++) {
+    const n = new NonceIssuer();
+    const issued = await Promise.all([n.current(), n.current(), n.current(), n.current()]);
+    for (const x of issued) assert.ok(await n.valid(x));
+  }
+});
+
+test('Sealer: round-trips, and refuses tampered, foreign and expired values', async () => {
+  const s = new Sealer();
+  const v = await s.seal({ kind: 'login' }, 60);
+  const opened = await s.open(v);
+  assert.deepEqual(opened.data, { kind: 'login' });
+  assert.equal(typeof opened.id, 'string');
+  assert.notEqual((await s.open(await s.seal(1, 60))).id, opened.id, 'unique ids');
+  const [body, mac] = v.split('.');
+  const forged = Buffer.from(JSON.stringify({ d: { kind: 'add', userId: 'victim' }, exp: now() + 60, id: 'x' })).toString('base64url');
+  for (const bad of [`${forged}.${mac}`, `${body}.${'A'.repeat(22)}`, `${body}.${mac}.x`, body, '', null, 42, 'x'.repeat(5000)]) {
+    assert.equal(await s.open(bad), null, String(bad).slice(0, 30));
+  }
+  assert.equal(await new Sealer().open(v), null, "another server's seal");
+  assert.equal(await s.open(await s.seal(1, -1)), null, 'expired');
+});
+
+test('RateLimiter: burst, refill, and failing open when its table is full', async () => {
+  const rl = new RateLimiter({ rate: 1000, burst: 3, max: 2 });
+  for (let i = 0; i < 3; i++) rl.take('a');
+  assert.throws(() => rl.take('a'), (e) => e instanceof RateLimitError && e.status === 429 && Number(e.headers['retry-after']) >= 1);
+  await new Promise((r) => setTimeout(r, 10));
+  rl.take('a');   // refilled
+  rl.take('b');
+  // Table full of active clients: a new client is let through rather than locked out.
+  for (let i = 0; i < 10; i++) rl.take(`new${i}`);
+  const slow = new RateLimiter({ rate: 1 / 60, burst: 1 });
+  slow.take('x');
+  assert.throws(() => slow.take('x'), (e) => Number(e.headers['retry-after']) >= 59);
 });

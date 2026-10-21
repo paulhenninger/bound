@@ -1,30 +1,44 @@
 // Bound Issuer: authenticates users with passkeys and issues Bound tokens.
 // Plays the roles OIDC splits between "OpenID Provider" and "Authorization Server".
 
-import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as cfg from '../config.js';
 import { createServer, listen, HttpError, cookie } from '../lib/http.js';
-import { b64u, utf8, randomId, now } from '../lib/encoding.js';
-import { generateKeyPair, exportPublicJwk, exportPrivateJwk, importKeyPairJwk } from '../lib/keys.js';
+import { b64u, unb64u, utf8, fromUtf8, randomId, now } from '../lib/encoding.js';
+import { exportPublicJwk, importKeyPairJwk } from '../lib/keys.js';
 import { issueToken, parseToken, verifyToken } from '../lib/token.js';
 import { verifyProof, ReplayCache, NonceIssuer } from '../lib/proof.js';
 import { tokenFromHeaders, AuthError, wwwAuthenticate } from '../lib/verifier.js';
 import { verifyRegistration, verifyAssertion, WebAuthnError } from '../lib/webauthn.js';
-import { ExpiringMap } from '../lib/state.js';
+import { ExpiringMap, Sealer, RateLimiter, clientAddress } from '../lib/state.js';
 import { isAllowedRpOrigin } from '../lib/origins.js';
+import { loadStore, saver, pruneKeys } from './store.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(here, '..', '..');
 
 const SESSION_TTL = 8 * 3600;
+const CHALLENGE_TTL = 300;
 const REQUEST_TTL = 600;
 const CLAIMS = ['name', 'username'];
 const LOOKUP_FAILURES = 5;          // failed user-code lookups allowed per session...
 const LOOKUP_WINDOW = 60;           // ...per this many seconds
+const SESSIONS_PER_USER = 10;       // oldest is ended when a user exceeds this
+const GRANTS_PER_USER = 100;        // live grants; more must be revoked first
 // Control, format (incl. bidi overrides) and unassigned code points: never in display text.
 const UNSAFE_TEXT = /[\p{C}]/u;
+
+/**
+ * Per-address rate limits (requests per second, burst). Generous for people,
+ * tight enough that one address can't monopolise a shared resource.
+ */
+export const DEFAULT_RATES = {
+  http: { rate: 50, burst: 500 },          // every request
+  signup: { rate: 1 / 60, burst: 5 },      // account creation attempts
+  signin: { rate: 1 / 5, burst: 20 },      // passkey sign-in attempts
+  device: { rate: 1 / 30, burst: 10 },     // new Flow B requests (so ≤ 30 pending per address)
+};
 
 /** Human description of what a grant's `res` covers, for consent screens. */
 export function describeScope(res) {
@@ -40,63 +54,69 @@ export async function createIssuer(opts = {}) {
   const dataFile = opts.dataFile ?? join(ROOT, 'data', 'issuer.json');
   const resourceServers = opts.resourceServers ?? cfg.RESOURCE_SERVERS;
   const ttl = { identity: opts.identityTtl ?? cfg.IDENTITY_TTL, access: opts.accessTtl ?? cfg.ACCESS_TTL, renew: opts.renewWindow ?? cfg.RENEW_WINDOW };
-  const limits = { challenges: 10000, sessions: 100000, requests: 10000, ...opts.limits };
+  const limits = { sessions: 100000, requests: 10000, usedChallenges: 100000, replay: 200000, ...opts.limits };
+  const rates = { ...DEFAULT_RATES, ...opts.rates };
 
   // ---- persistent state --------------------------------------------------
-  // A missing file means a fresh issuer. A file that exists but can't be read
-  // is an error: silently replacing it would discard the signing key, every
-  // account and every grant.
-  let db;
-  let raw = null;
-  try { raw = await readFile(dataFile, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-  if (raw === null) {
-    const kp = await generateKeyPair({ extractable: true });
-    db = { kid: randomId(8), key: await exportPrivateJwk(kp.privateKey), pairwiseSecret: randomId(32), users: {}, grants: {} };
-  } else {
-    try { db = JSON.parse(raw); } catch { db = null; }
-    if (!db?.key || !db.kid || !db.pairwiseSecret || !db.users || !db.grants) {
-      throw new Error(`${dataFile} is unreadable or incomplete. Refusing to start rather than replace it. ` +
-        'Restore it from a backup, or delete it to start a fresh issuer (all accounts and grants will be lost).');
-    }
-  }
-  // Writes are serialized and atomic (write a temp file, then rename over the
-  // old one), so a crash mid-write can't leave a truncated file behind.
-  let saving = Promise.resolve();
-  const save = () => {
-    saving = saving.catch(() => {}).then(async () => {
-      await mkdir(dirname(dataFile), { recursive: true });
-      const tmp = `${dataFile}.${randomId(6)}.tmp`;
-      await writeFile(tmp, JSON.stringify(db, null, 2), { mode: 0o600 });
-      await rename(tmp, dataFile);
-    });
-    return saving;
-  };
-  if (raw === null) await save();
+  const { db, fresh, migrated } = await loadStore(dataFile);
+  const save = saver(dataFile, db);
+  const pruned = pruneKeys(db) | pruneGrants();
+  if (fresh || migrated || pruned) await save();
 
-  const keyPair = await importKeyPairJwk(db.key);
-  const publicJwk = { ...(await exportPublicJwk(keyPair.publicKey)), kid: db.kid, alg: 'ES256', use: 'sig' };
-  const signer = { iss: origin, kid: db.kid, privateKey: keyPair.privateKey };
-  const issuerKey = async (iss, kid) => (iss === origin && kid === db.kid ? keyPair.publicKey : null);
+  const keys = new Map();   // kid -> { publicKey, privateKey, jwk }
+  for (const k of db.keys) {
+    const kp = await importKeyPairJwk(k.key);
+    keys.set(k.kid, { ...kp, jwk: { ...(await exportPublicJwk(kp.publicKey)), kid: k.kid, alg: 'ES256', use: 'sig' } });
+  }
+  const current = db.keys.at(-1);
+  const signer = { iss: origin, kid: current.kid, privateKey: keys.get(current.kid).privateKey };
+  const issuerKey = async (iss, kid) => (iss === origin ? keys.get(kid)?.publicKey ?? null : null);
 
   const hmacKey = await crypto.subtle.importKey('raw', utf8(db.pairwiseSecret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   /** Pairwise subject: the same user gets an unlinkable identifier at each audience. */
   const pairwiseSub = async (userId, audience) =>
     b64u(new Uint8Array(await crypto.subtle.sign('HMAC', hmacKey, utf8(`${userId}|${audience}`))).subarray(0, 16));
 
-  // ---- ephemeral state (bounded, self-expiring) --------------------------
-  const challenges = new ExpiringMap({ max: limits.challenges });   // challenge -> { kind, ... }
+  /** Grants whose renewal window has closed are dead whether revoked or not: forget them. */
+  function pruneGrants(t = now()) {
+    let n = 0;
+    for (const [gid, g] of Object.entries(db.grants)) if (g.rex < t) { delete db.grants[gid]; n++; }
+    return n > 0;
+  }
+
+  // ---- ephemeral state ---------------------------------------------------
+  // Nothing an anonymous client can trigger is stored before it has done real
+  // work: challenges are sealed, not stored, and only recorded as used after a
+  // successful passkey ceremony.
+  const sealer = new Sealer();
+  const usedChallenges = new ExpiringMap({ max: limits.usedChallenges });
   const sessions = new ExpiringMap({ max: limits.sessions });       // sid -> { userId, jkt, fails }
+  const userSessions = new Map();                                    // userId -> [sid], oldest first
   const requests = new ExpiringMap({ max: limits.requests });       // request_id -> back-channel request
   const codes = new ExpiringMap({ max: limits.requests });          // normalized user code -> request_id
-  const replay = new ReplayCache();
+  // Two replay caches: Flow B accepts proofs from any key, so anonymous clients
+  // must not be able to fill the cache that sessions and renewal depend on.
+  const replay = new ReplayCache({ max: limits.replay });
+  const anonReplay = new ReplayCache({ max: limits.replay });
   const nonces = new NonceIssuer();
+  const limit = Object.fromEntries(Object.entries(rates).filter(([k, r]) => k !== 'http' && r).map(([k, r]) => [k, new RateLimiter(r)]));
+  const throttle = (name, ctx) => limit[name]?.take(clientAddress(ctx));
 
-  const newChallenge = (data) => { const c = randomId(32); challenges.set(c, data, now() + 300); return c; };
-  const takeChallenge = (c, kind) => {
-    const v = typeof c === 'string' ? challenges.take(c) : undefined;
-    if (!v || v.kind !== kind) throw new HttpError(400, 'invalid_challenge');
-    return v;
-  };
+  // A challenge is a sealed { kind, ... }, wrapped in base64url because that's
+  // what WebAuthn hands back to us in clientDataJSON.
+  const newChallenge = async (data) => b64u(utf8(await sealer.seal(data, CHALLENGE_TTL)));
+  async function openChallenge(c, kind) {
+    let sealed;
+    try { sealed = fromUtf8(unb64u(c)); } catch { sealed = null; }
+    const ch = await sealer.open(sealed);
+    if (!ch || ch.data?.kind !== kind || usedChallenges.has(ch.id)) throw new HttpError(400, 'invalid_challenge');
+    return ch;
+  }
+  /** Record a challenge as used. Call only after everything else succeeded. */
+  function spendChallenge(ch) {
+    if (usedChallenges.has(ch.id)) throw new HttpError(400, 'invalid_challenge');
+    usedChallenges.set(ch.id, true, ch.exp);
+  }
 
   // ---- device-bound issuer session ---------------------------------------
   // Like an RP's bound session (SPEC §9, §13): the cookie only counts together
@@ -105,14 +125,21 @@ export async function createIssuer(opts = {}) {
   async function sessionProof(ctx) {
     try {
       return await verifyProof(ctx.headers['bound-proof'], { method: ctx.method, url: ctx.fullUrl, body: ctx.body, replay, nonces });
-    } catch (e) { throw new HttpError(401, e.code === 'use_nonce' ? 'use_nonce' : 'invalid_proof', e.message); }
+    } catch (e) {
+      if (e.code === 'busy') throw new HttpError(503, 'busy', e.message);
+      throw new HttpError(401, e.code === 'use_nonce' ? 'use_nonce' : 'invalid_proof', e.message);
+    }
   }
-  const startSession = async (ctx, userId) => {
-    const proof = await sessionProof(ctx);
+  function startSession(ctx, userId, jkt) {
     const sid = randomId(32);
-    sessions.set(sid, { userId, jkt: proof.jkt, fails: [] }, now() + SESSION_TTL);
+    sessions.set(sid, { userId, jkt, fails: [] }, now() + SESSION_TTL);
+    // Each user has a bounded number of sessions; signing in again ends the oldest.
+    const mine = (userSessions.get(userId) ?? []).filter((x) => sessions.has(x));
+    mine.push(sid);
+    while (mine.length > SESSIONS_PER_USER) sessions.delete(mine.shift());
+    userSessions.set(userId, mine);
     ctx.res.setHeader('set-cookie', cookie(origin, 'bound_idp', sid, SESSION_TTL));
-  };
+  }
   /** The signed-in user, or null. Throws if a session cookie comes without a valid proof. */
   const currentSession = async (ctx) => {
     const s = sessions.get(ctx.cookies.bound_idp);
@@ -133,7 +160,10 @@ export async function createIssuer(opts = {}) {
     return cur;
   };
   const requireUser = async (ctx) => (await requireSession(ctx)).user;
-  const publicUser = (u) => ({ id: u.id, username: u.username, displayName: u.displayName });
+  const publicUser = (u) => ({
+    id: u.id, username: u.username, displayName: u.displayName,
+    passkeys: u.credentials.map((c) => ({ id: c.credentialId, created: c.created ?? u.created })),
+  });
 
   // ---- input validation --------------------------------------------------
   function validateGrants(aud, grants) {
@@ -177,16 +207,21 @@ export async function createIssuer(opts = {}) {
     // One live grant per (user, client, key). Re-approving the same access
     // extends it; approving different access replaces it, so an old, broader
     // grant can't linger behind a narrower new one.
+    const t = now();
+    pruneGrants(t);
     const scope = JSON.stringify([aud, grants]);
     let result = null;
+    let live = 0;
     for (const g of Object.values(db.grants)) {
-      if (g.revoked || g.userId !== user.id || g.client !== client || g.jkt !== jkt) continue;
-      if (!result && JSON.stringify([g.aud, g.grants]) === scope) { g.rex = now() + ttl.renew; result = g; }
+      if (g.revoked || g.userId !== user.id) continue;
+      if (g.client !== client || g.jkt !== jkt) { live++; continue; }
+      if (!result && JSON.stringify([g.aud, g.grants]) === scope) { g.rex = t + ttl.renew; result = g; live++; }
       else { g.revoked = true; g.revokedReason = 'superseded'; }
     }
     if (!result) {
+      if (live >= GRANTS_PER_USER) throw new HttpError(409, 'too_many_grants', `you have ${live} active grants; revoke some at your Bound ID account first`);
       const gid = randomId(12);
-      result = db.grants[gid] = { gid, userId: user.id, client, kind, aud, grants, jkt, created: now(), rex: now() + ttl.renew, revoked: false };
+      result = db.grants[gid] = { gid, userId: user.id, client, kind, aud, grants, jkt, created: t, rex: t + ttl.renew, revoked: false };
     }
     await save();
     return result;
@@ -224,13 +259,15 @@ export async function createIssuer(opts = {}) {
       });
       if (proof.jkt !== token.holder) throw new AuthError('invalid_proof', 'proof key is not the token holder');
     } catch (e) {
+      if (e.code === 'busy') throw new HttpError(503, 'busy', e.message);
       const err = e instanceof AuthError ? e : new AuthError(e.code ?? 'invalid_token', e.message);
       throw new HttpError(401, err.code, err.message, { 'www-authenticate': wwwAuthenticate(err) });
     }
     if (token.blockCount !== 1) throw new HttpError(400, 'not_renewable', 'only root tokens are renewable; ask your delegator');
     if (typeof token.root.gid !== 'string' || !token.root.grants.length) throw new HttpError(401, 'invalid_token', 'not an access token');
     const g = Object.hasOwn(db.grants, token.root.gid) ? db.grants[token.root.gid] : null;
-    if (!g || g.jkt !== token.holder) throw new HttpError(401, 'invalid_token', 'unknown grant');
+    if (!g) throw new HttpError(401, 'renewal_window_closed', 'the grant has ended; authorize again');
+    if (g.jkt !== token.holder) throw new HttpError(401, 'invalid_token', 'unknown grant');
     return g;
   }
 
@@ -252,7 +289,7 @@ export async function createIssuer(opts = {}) {
   // ---- routes ------------------------------------------------------------
   const routes = [
     ['GET /.well-known/bound-issuer', () => ({
-      issuer: origin, version: 1, alg: 'ES256', keys: [publicJwk],
+      issuer: origin, version: 1, alg: 'ES256', keys: [...keys.values()].map((k) => k.jwk),
       mediator: `${origin}/bound/mediator.html`,
       request_endpoint: `${origin}/bound/request`,
       token_endpoint: `${origin}/bound/token`,
@@ -261,51 +298,62 @@ export async function createIssuer(opts = {}) {
       interaction: `${origin}/device.html`,
     })],
 
-    // Passkey registration (creates the account).
-    ['POST /webauthn/register/options', (ctx) => {
-      const { username, displayName } = ctx.json();
+    // Passkey registration: creates an account, or (signed in) adds a passkey to it.
+    ['POST /webauthn/register/options', async (ctx) => {
+      const body = ctx.json();
+      if (body.add === true) {
+        const { user } = await requireSession(ctx);
+        return creationOptions(await newChallenge({ kind: 'add', userId: user.id }), user.id, user.username, user.displayName,
+          user.credentials.map((c) => c.credentialId));
+      }
+      const { username, displayName } = body;
       if (typeof username !== 'string' || !/^[a-z0-9._-]{2,32}$/i.test(username)) throw new HttpError(400, 'invalid_username');
       const name = displayName === undefined || displayName === '' ? username : cleanText(displayName, { field: 'displayName', max: 64 });
       if (Object.values(db.users).some((u) => u.username === username)) throw new HttpError(409, 'username_taken');
       const userId = randomId(16);
-      const challenge = newChallenge({ kind: 'register', username, displayName: name, userId });
-      return {
-        challenge, rp: { id: rpId, name: 'Bound Demo Issuer' },
-        user: { id: userId, name: username, displayName: name },
-        pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
-        authenticatorSelection: { residentKey: 'required', userVerification: 'required' },
-        attestation: 'none', timeout: 120000,
-      };
+      return creationOptions(await newChallenge({ kind: 'register', username, displayName: name, userId }), userId, username, name, []);
     }],
     ['POST /webauthn/register/verify', async (ctx) => {
       checkOrigin(ctx);
       const { challenge, credential } = ctx.json();
-      const c = takeChallenge(challenge, 'register');
+      // Peek at the kind to apply the right limit before doing any real work.
+      let kind = null;
+      try { kind = JSON.parse(fromUtf8(unb64u(fromUtf8(unb64u(challenge)).split('.')[0]))).d?.kind; } catch { /* checked properly below */ }
+      if (kind === 'add') return addPasskey(ctx, challenge, credential);
+      throttle('signup', ctx);
+      const ch = await openChallenge(challenge, 'register');
+      const c = ch.data;
       const cred = await verifyRegistration({ credential, expectedChallenge: challenge, expectedOrigin: origin, rpId }).catch(passkeyError);
       // Checked again here: two sign-ups may have raced for the same name.
       if (Object.values(db.users).some((u) => u.username === c.username)) throw new HttpError(409, 'username_taken');
-      if (Object.values(db.users).some((u) => u.credentials.some((x) => x.credentialId === cred.credentialId))) {
-        throw new HttpError(409, 'credential_exists', 'this passkey is already registered');
-      }
-      await startSession(ctx, c.userId);
-      db.users[c.userId] = { id: c.userId, username: c.username, displayName: c.displayName, credentials: [cred], created: now() };
+      if (credentialTaken(cred.credentialId)) throw new HttpError(409, 'credential_exists', 'this passkey is already registered');
+      // The session proof is checked before the challenge is spent: if its nonce
+      // went stale during a slow passkey prompt, the client can retry the same
+      // ceremony with a fresh nonce.
+      const proof = await sessionProof(ctx);
+      spendChallenge(ch);
+      db.users[c.userId] = { id: c.userId, username: c.username, displayName: c.displayName, credentials: [{ ...cred, created: now() }], created: now() };
       await save();
+      startSession(ctx, c.userId, proof.jkt);
       return { user: publicUser(db.users[c.userId]) };
     }],
 
     // Passkey sign-in (discoverable credentials; no username needed).
-    ['POST /webauthn/login/options', () => ({ challenge: newChallenge({ kind: 'login' }), rpId, userVerification: 'required', timeout: 120000 })],
+    ['POST /webauthn/login/options', async () => ({ challenge: await newChallenge({ kind: 'login' }), rpId, userVerification: 'required', timeout: 120000 })],
     ['POST /webauthn/login/verify', async (ctx) => {
       checkOrigin(ctx);
+      throttle('signin', ctx);
       const { challenge, credential } = ctx.json();
-      takeChallenge(challenge, 'login');
+      const ch = await openChallenge(challenge, 'login');
       const user = Object.values(db.users).find((u) => u.credentials.some((c) => c.credentialId === credential?.id));
       if (!user) throw new HttpError(401, 'unknown_credential');
       const stored = user.credentials.find((c) => c.credentialId === credential.id);
       const { signCount } = await verifyAssertion({ credential, stored, expectedChallenge: challenge, expectedOrigin: origin, rpId }).catch(passkeyError);
-      await startSession(ctx, user.id);
-      stored.signCount = signCount;
-      await save();
+      const proof = await sessionProof(ctx);   // before spending the challenge, as above
+      spendChallenge(ch);
+      // Most passkeys report a counter of 0; only write when it actually moved.
+      if (signCount !== stored.signCount) { stored.signCount = signCount; await save(); }
+      startSession(ctx, user.id, proof.jkt);
       return { user: publicUser(user) };
     }],
 
@@ -318,16 +366,37 @@ export async function createIssuer(opts = {}) {
     ['POST /api/logout', async (ctx) => {
       checkOrigin(ctx);
       // Only the session's own key can end it; the cookie alone can't.
-      const cur = await currentSession(ctx).catch(() => null);
+      const cur = await currentSession(ctx).catch((e) => { if (e.code === 'use_nonce') throw e; return null; });
       if (cur) sessions.delete(ctx.cookies.bound_idp);
       ctx.res.setHeader('set-cookie', cookie(origin, 'bound_idp', '', 0));
+      return { ok: !!cur };
+    }],
+    ['POST /api/account/delete', async (ctx) => {
+      const { user } = await requireSession(ctx);
+      if (ctx.json().username !== user.username) throw new HttpError(400, 'invalid_request', 'type your username to confirm');
+      for (const [gid, g] of Object.entries(db.grants)) if (g.userId === user.id) delete db.grants[gid];
+      delete db.users[user.id];
+      for (const sid of userSessions.get(user.id) ?? []) sessions.delete(sid);
+      userSessions.delete(user.id);
+      await save();
+      ctx.res.setHeader('set-cookie', cookie(origin, 'bound_idp', '', 0));
       return { ok: true };
+    }],
+    ['POST /api/passkeys/:id/delete', async (ctx) => {
+      const { user } = await requireSession(ctx);
+      const i = user.credentials.findIndex((c) => c.credentialId === ctx.params.id);
+      if (i < 0) throw new HttpError(404, 'not_found');
+      if (user.credentials.length === 1) throw new HttpError(409, 'last_passkey', 'this is your only passkey; add another first, or delete the account');
+      user.credentials.splice(i, 1);
+      await save();
+      return { user: publicUser(user) };
     }],
     ['GET /api/grants', async (ctx) => {
       if (ctx.headers.origin && ctx.headers.origin !== origin) throw new HttpError(403, 'bad_origin');
       const cur = await currentSession(ctx);
       if (!cur) throw new HttpError(401, 'login_required');
-      return { grants: Object.values(db.grants).filter((g) => g.userId === cur.user.id && !g.revoked)
+      const t = now();
+      return { grants: Object.values(db.grants).filter((g) => g.userId === cur.user.id && !g.revoked && g.rex >= t)
         .map((g) => ({
           gid: g.gid, client: g.client, verified: g.kind === 'site', created: g.created, rex: g.rex,
           grants: describe(g.aud, g.grants),
@@ -376,6 +445,7 @@ export async function createIssuer(opts = {}) {
 
     // Flow B: back-channel authorization for clients without a browser.
     ['POST /bound/request', async (ctx) => {
+      throttle('device', ctx);
       const proof = await checkProof(ctx);
       const body = ctx.json();
       const client_name = cleanText(body.client_name, { field: 'client_name', max: 64 });
@@ -388,7 +458,7 @@ export async function createIssuer(opts = {}) {
       const exp = now() + REQUEST_TTL;
       requests.set(request_id, {
         request_id, user_code, client_name, aud: body.aud, grants: clean, jkt: proof.jkt, status: 'pending', created: now(),
-        network: ctx.req.socket.remoteAddress ?? 'unknown',
+        network: clientAddress(ctx),
       }, exp);
       codes.set(normalizeCode(user_code), request_id, exp);
       return { request_id, user_code, interact: `${origin}/device.html`, expires_in: REQUEST_TTL, interval: 2 };
@@ -440,21 +510,49 @@ export async function createIssuer(opts = {}) {
     }],
 
     // Revocation by the holder, e.g. when the user signs out of the client.
+    // Revoking an already-revoked or ended grant succeeds: the outcome is the same.
     ['POST /bound/revoke', async (ctx) => {
-      const g = await holderGrant(ctx);
-      if (!g.revoked) { g.revoked = true; g.revokedReason = 'holder'; await save(); }
+      const g = await holderGrant(ctx).catch((e) => { if (e.code === 'renewal_window_closed') return null; throw e; });
+      if (g && !g.revoked) { g.revoked = true; g.revokedReason = 'holder'; await save(); }
       return { ok: true };
     }],
   ];
 
+  function creationOptions(challenge, userId, name, displayName, exclude) {
+    return {
+      challenge, rp: { id: rpId, name: 'Bound Demo Issuer' },
+      user: { id: userId, name, displayName },
+      pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
+      authenticatorSelection: { residentKey: 'required', userVerification: 'required' },
+      excludeCredentials: exclude.map((id) => ({ type: 'public-key', id })),
+      attestation: 'none', timeout: 120000,
+    };
+  }
+
+  const credentialTaken = (id) => Object.values(db.users).some((u) => u.credentials.some((x) => x.credentialId === id));
+
+  /** Add a passkey to the signed-in account. */
+  async function addPasskey(ctx, challenge, credential) {
+    const { user } = await requireSession(ctx);
+    throttle('signup', ctx);
+    const ch = await openChallenge(challenge, 'add');
+    if (ch.data.userId !== user.id) throw new HttpError(400, 'invalid_challenge');
+    const cred = await verifyRegistration({ credential, expectedChallenge: challenge, expectedOrigin: origin, rpId }).catch(passkeyError);
+    if (credentialTaken(cred.credentialId)) throw new HttpError(409, 'credential_exists', 'this passkey is already registered');
+    spendChallenge(ch);
+    user.credentials.push({ ...cred, created: now() });
+    await save();
+    return { user: publicUser(user) };
+  }
+
   async function checkProof(ctx) {
     try {
-      return await verifyProof(ctx.headers['bound-proof'], { method: ctx.method, url: ctx.fullUrl, body: ctx.body, replay });
-    } catch (e) { throw new HttpError(401, e.code ?? 'invalid_proof', e.message); }
+      return await verifyProof(ctx.headers['bound-proof'], { method: ctx.method, url: ctx.fullUrl, body: ctx.body, replay: anonReplay });
+    } catch (e) { throw new HttpError(e.code === 'busy' ? 503 : 401, e.code ?? 'invalid_proof', e.message); }
   }
 
   const server = createServer({
-    origin, routes, nonces,
+    origin, routes, nonces, rate: rates.http,
     staticDirs: { '/lib/': join(ROOT, 'src', 'lib'), '/': join(here, 'public') },
     // Only the protocol endpoints a client calls directly are open cross-origin.
     // They are authenticated by token + proof, never by cookies.
@@ -470,6 +568,7 @@ export async function createIssuer(opts = {}) {
 }
 
 function passkeyError(e) {
+  if (e instanceof HttpError) throw e;
   if (e instanceof WebAuthnError) throw new HttpError(401, 'passkey_rejected', e.message);
   throw new HttpError(400, 'invalid_request', 'malformed passkey response');
 }

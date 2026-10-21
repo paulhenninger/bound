@@ -3,6 +3,7 @@
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, normalize, sep } from 'node:path';
+import { RateLimiter } from './state.js';
 
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
 
@@ -32,8 +33,11 @@ export function cookie(origin, name, value, maxAge) {
 /**
  *   nonces: optional NonceIssuer; every response then carries a fresh
  *           `Bound-Nonce` header for clients to put in their next proof.
+ *   rate:   per-address limit on all requests, { rate (per second), burst },
+ *           or false. Endpoints add stricter limits of their own.
  */
-export function createServer({ origin, routes, staticDirs = {}, cors, headers: baseHeaders = {}, nonces }) {
+export function createServer({ origin, routes, staticDirs = {}, cors, headers: baseHeaders = {}, nonces, rate = { rate: 50, burst: 500 } }) {
+  const limiter = rate ? new RateLimiter(rate) : null;
   const handle = async (req, res) => {
     let ctx = { req, res, headers: req.headers };
     const send = (status, payload, extra = {}) => {
@@ -51,6 +55,7 @@ export function createServer({ origin, routes, staticDirs = {}, cors, headers: b
       res.end(isJson ? JSON.stringify(payload) : payload);
     };
     try {
+      limiter?.take(req.socket.remoteAddress ?? 'unknown');
       const chunks = [];
       let size = 0;
       for await (const c of req) { size += c.length; if (size > 1 << 20) throw new HttpError(413, 'too_large'); chunks.push(c); }

@@ -9,6 +9,7 @@
   "scripts": {
     "start": "node src/start.js",
     "cli": "node src/cli/notes.js",
+    "rotate-key": "node src/issuer/rotate-key.js",
     "test": "node --test \"test/*.test.js\""
   }
 }

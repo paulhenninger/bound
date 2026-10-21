@@ -34,6 +34,20 @@
       <p class="muted small">Apps you have given access to. Revoking stops renewal immediately; any token already issued dies within minutes.</p>
       <ul class="plain" id="grants"></ul>
     </div>
+    <div class="panel">
+      <h2>Passkeys</h2>
+      <p class="muted small">Add a passkey on another device so you can still sign in if you lose this one.</p>
+      <ul class="plain" id="passkeys"></ul>
+      <div class="row"><button id="add-passkey">Add a passkey</button></div>
+      <p class="err small" id="passkey-error"></p>
+    </div>
+    <div class="panel">
+      <h2>Delete account</h2>
+      <p class="muted small">Deletes your account and revokes every grant. Remove the passkey from your device afterwards.</p>
+      <label for="confirm-username">Type your username to confirm</label><input id="confirm-username" autocomplete="off">
+      <div class="row"><button id="delete-account">Delete my account</button></div>
+      <p class="err small" id="delete-error"></p>
+    </div>
   </section>
 </main>
 </body>
