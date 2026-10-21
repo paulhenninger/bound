@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Approve a device · Bound ID</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/device.js"></script>
+</head>
+<body>
+<main>
+  <header class="brand"><div class="mark">B</div><h1>Approve a device</h1></header>
+
+  <section class="panel hidden" id="auth">
+    <h2>Sign in first</h2>
+    <div class="row"><button class="primary do-login">Sign in with a passkey</button></div>
+    <p class="auth-error err small"></p>
+  </section>
+
+  <section class="panel hidden" id="enter">
+    <p class="muted small flush">Signed in as <strong id="who"></strong></p>
+    <h2>Enter the code shown on your device</h2>
+    <p class="muted small notice">Type it yourself. Never use a code that someone sent you: whoever started the request gets the access.</p>
+    <input id="code" class="code-big" autocomplete="off" placeholder="XXXX-XXXX" maxlength="9">
+    <div class="row"><button class="primary" id="lookup">Continue</button></div>
+    <p class="err small" id="enter-error"></p>
+  </section>
+
+  <section class="panel hidden" id="decide">
+    <h2>A device calling itself <span class="unverified" id="client"></span><span class="tag">name not verified</span> wants to:</h2>
+    <ul class="plain" id="asks"></ul>
+    <p class="small" id="duration"></p>
+    <p class="muted small" id="when"></p>
+    <p class="muted small notice">Only continue if you started this on your own device just now. If someone gave you this code, deny it.</p>
+    <div class="row"><button class="primary" id="approve">Allow</button><button id="deny">Deny</button></div>
+    <p class="err small" id="decide-error"></p>
+  </section>
+
+  <section class="panel hidden" id="done"><p id="done-msg"></p><a href="/">Back to account</a></section>
+</main>
+</body>
+</html>

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in with Bound ID</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/bound/mediator.js"></script>
+</head>
+<body>
+<main>
+  <header class="brand"><div class="mark">B</div><h1>Bound ID</h1></header>
+
+  <section class="panel" id="waiting"><p class="muted">Waiting for the requesting site…</p></section>
+  <section class="panel hidden" id="fatal"><p class="err" id="fatal-msg"></p></section>
+
+  <section class="panel hidden" id="auth">
+    <h2>Sign in to continue to <span class="origin rp-origin"></span></h2>
+    <div class="row"><button class="primary do-login">Sign in with a passkey</button></div>
+    <details class="mt"><summary class="small muted">Create an account instead</summary>
+      <label for="u">Username</label><input id="u" class="username" placeholder="ada">
+      <label for="d">Display name</label><input id="d" class="displayname" placeholder="Ada Lovelace">
+      <div class="row"><button class="do-register">Create account with a passkey</button></div>
+    </details>
+    <p class="auth-error err small"></p>
+  </section>
+
+  <section class="panel hidden" id="consent">
+    <p class="muted small flush">Signed in as <strong id="who"></strong> <button class="link" id="switch">Not you?</button></p>
+    <h2><span class="origin rp-origin"></span> wants to:</h2>
+    <ul class="plain" id="asks"></ul>
+    <p class="small" id="duration"></p>
+    <p class="muted small">The site's address above was verified by your browser. Tokens are sent only to that site and only work with a key that never leaves this browser.</p>
+    <div class="row"><button class="primary" id="approve">Allow</button><button id="deny">Cancel</button></div>
+    <p class="err small" id="consent-error"></p>
+  </section>
+</main>
+</body>
+</html>

@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Notebook</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+<main>
+  <p class="err small hidden" id="wrong-host"></p>
+  <header class="brand"><div class="mark">N</div><h1>Notebook <span class="muted small">demo relying party</span></h1></header>
+
+  <section class="panel hidden" id="signed-out">
+    <h2>Welcome</h2>
+    <p class="muted">Notebook keeps your notes in the Notes API. Sign in with Bound ID; no passwords, no redirects.</p>
+    <label class="check"><input type="checkbox" id="want-notes" checked> Also let Notebook read and write my notes</label>
+    <div class="row"><button class="primary" id="signin">Sign in with Bound ID</button></div>
+    <p class="err small" id="signin-error"></p>
+  </section>
+
+  <section class="hidden" id="signed-in">
+    <div class="panel">
+      <h2>Hello, <span id="name"></span></h2>
+      <dl class="facts">
+        <dt>Your ID at this site</dt><dd class="mono" id="sub"></dd>
+        <dt>Session key thumbprint</dt><dd class="mono" id="jkt"></dd>
+      </dl>
+      <div class="row">
+        <button id="steal">Replay my cookie without the key</button>
+        <button id="signout">Sign out</button>
+      </div>
+      <p class="small" id="steal-out"></p>
+    </div>
+
+    <div class="panel hidden" id="connect-panel">
+      <h2>Notes</h2>
+      <p class="muted small">Notebook can't see your notes yet.</p>
+      <div class="row"><button class="primary" id="connect">Let Notebook read and write my notes</button></div>
+      <p class="err small" id="connect-error"></p>
+    </div>
+
+    <div class="panel" id="notes-panel">
+      <h2>Notes</h2>
+      <form id="add" class="row add"><input id="text" placeholder="Write a note…" maxlength="500"><button class="primary">Add</button></form>
+      <ul class="plain mt" id="notes"></ul>
+      <p class="err small" id="notes-error"></p>
+    </div>
+
+    <div class="panel" id="atten-panel">
+      <h2>Attenuation &amp; delegation</h2>
+      <p class="muted small">Notebook's server derives a 60-second, read-only token for a background worker, bound to the worker's own key, without contacting the issuer. Then it tries to misuse it.</p>
+      <div class="row"><button id="atten">Run it</button></div>
+      <div id="atten-out"></div>
+    </div>
+  </section>
+</main>
+</body>
+</html>

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bound ID</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/account.js"></script>
+</head>
+<body>
+<main>
+  <p class="err small hidden" id="wrong-host"></p>
+  <header class="brand"><div class="mark">B</div><h1>Bound ID <span class="muted small">demo issuer</span></h1></header>
+
+  <section class="panel hidden" id="auth">
+    <h2>Sign in</h2>
+    <p class="muted small">Bound ID accounts use passkeys only. There are no passwords to steal or phish.</p>
+    <div class="row"><button class="primary do-login">Sign in with a passkey</button></div>
+    <hr>
+    <h2>New here?</h2>
+    <label for="u">Username</label><input id="u" class="username" autocomplete="username" placeholder="ada">
+    <label for="d">Display name</label><input id="d" class="displayname" placeholder="Ada Lovelace">
+    <div class="row"><button class="do-register">Create account with a passkey</button></div>
+    <p class="auth-error err small"></p>
+  </section>
+
+  <section class="hidden" id="account">
+    <div class="panel">
+      <h2>Signed in as <span id="who"></span></h2>
+      <div class="row"><button id="logout">Sign out</button><a href="/device.html"><button>Approve a device</button></a></div>
+    </div>
+    <div class="panel">
+      <h2>Active grants</h2>
+      <p class="muted small">Apps you have given access to. Revoking stops renewal immediately; any token already issued dies within minutes.</p>
+      <ul class="plain" id="grants"></ul>
+    </div>
+  </section>
+</main>
+</body>
+</html>

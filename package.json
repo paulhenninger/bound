@@ -1,0 +1,14 @@
+{
+  "name": "bound",
+  "version": "0.1.0",
+  "description": "Bound: a proof-of-possession, browser-mediated alternative to OAuth 2 + OpenID Connect. Spec and reference implementation.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/start.js",
+    "cli": "node src/cli/notes.js",
+    "test": "node --test \"test/*.test.js\""
+  }
+}
