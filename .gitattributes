@@ -1,0 +1,13 @@
+# Store and check out text files with LF on every platform. This overrides
+# core.autocrlf (Git for Windows defaults it to true), so the bytes on disk
+# match what is committed and signed-data fixtures never change underfoot.
+* text=auto eol=lf
+
+# Never touch binaries.
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
